@@ -34,10 +34,10 @@ class ThreadPool
         pthread_cond_t cond;
     public:
         ThreadPool(int count):max_thread(count),idle_thread(0)
-    {
-        pthread_mutex_init(&lock,NULL);
-        pthread_cond_init(&cond,NULL);
-    }
+        {
+            pthread_mutex_init(&lock,NULL);
+            pthread_cond_init(&cond,NULL);
+        }
         void InitThreadPool()
         {
             pthread_t tid;
@@ -106,5 +106,28 @@ class ThreadPool
         }
 };
 
+class Singleton
+{
+    private:
+        static ThreadPool *p;
+        static pthread_mutex_t lock;
+    public:
+        static ThreadPool *GetInstance()
+        {
+            if(p==NULL)
+            {
+                pthread_mutex_lock(&lock);
+                if(p==NULL)//在外面再加一层判断的原因是为了提高效率，降低锁的开销。当一个线程进入到这里面new上一个对象以后赋值给p，即使它的时间片到了，这时候p已经不为空了，别的线程在外面那层判断就会直接返回，而不会进入到内部去加锁
+                {
+                    p=new ThreadPool(5);
+                    p->InitThreadPool();
+                }
+                pthread_mutex_unlock(&lock);
+            }
+            return p;
+        }
+};
+ThreadPool *Singleton::p=nullptr;
+pthread_mutex_t Singleton::lock=PTHREAD_MUTEX_INITIALIZER;//用来初始化锁的宏，这样不用调函数初始化也不用销毁
 
 #endif
