@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -252,7 +253,7 @@ class Http_Request{
                 if(pos!=std::string::npos)
                 {
                     cgi=true;
-                    path=uri.substr(0,pos);
+                    path+=uri.substr(0,pos);
                     query_string=uri.substr(pos+1);
                 } 
                 else
@@ -289,7 +290,7 @@ class Http_Request{
             }
             return true;
         }
-        bool IsPathLegal(Http_Response *rsp)
+        int IsPathLegal(Http_Response *rsp)
         {
             int rs=0;
             struct stat st;
@@ -305,7 +306,7 @@ class Http_Request{
                     path += "/";
                     path += HOMEPAGE;
                     stat(path.c_str(), &st);
-                    rs=st.st_mode;
+                    rs=st.st_size;
                 }
                 else if((st.st_mode & S_IXUSR) || 
                         (st.st_mode & S_IXGRP) ||
@@ -343,7 +344,7 @@ class Http_Request{
         {
             if(method=="GET")
             {
-                return query_string();
+                return query_string;
             }
             else
             {
@@ -431,17 +432,25 @@ class Connect
                 send(sock,it->c_str(),it->size(),0);
             }
         }
-        void SendResponseText(Http_Response *rsp)
+        void SendResponseText(Http_Response *rsp, bool _cgi)
         {
-            std::string &path=rsp->GetPath();
-            int fd=open(path.c_str(), O_RDONLY);
-            if(fd<0)
+            if(!_cgi)
             {
-                LOG("open file error!", WARNING);
-                return;
+                std::string &path=rsp->GetPath();
+                int fd=open(path.c_str(), O_RDONLY);
+                if(fd<0)
+                {
+                    LOG("open file error!", WARNING);
+                    return;
+                }
+                sendfile(sock,fd,NULL,rsp->ResourceSize());
+                close(fd);
             }
-            sendfile(sock,fd,NULL,rsp->ResourceSize());
-            close(fd);
+            else
+            {
+                std::string &rsp_text=rsp->response_text;
+                send(sock, rsp_text.c_str(), rsp_text.size(), 0);
+            }
         }
         ~Connect()
         {
@@ -460,8 +469,69 @@ class Entry
 
             con->SendStatusLine(rsp);
             con->SendResponseHeader(rsp);//将空行一起构建好发送
-            con->SendResponseText(rsp);
+            con->SendResponseText(rsp, false);
             LOG("Send Response Done!", NORMAL);
+        }
+        static int ProcessCgi(Connect *con, Http_Request *rq, Http_Response *rsp)
+        {
+            int input[2];
+            int output[2];
+            pipe(input);
+            pipe(output);
+            std::string bin=rsp->GetPath();//path中放的就是客户端请求的可执行程序的路径
+            std::string param=rq->GetParam();
+            int size=param.size();
+            std::string param_size="CONTENT-LENGTH=";
+            param_size+=Util::IntToString(size);
+
+            std::string &response_text=rsp->response_text;
+
+            pid_t pid=fork();
+            if(pid<0)
+            {
+                return 503;
+                LOG("Fork Error!", WARNING);
+            }
+            else if(pid==0)
+            {
+                //子进程从input中读数据，把运行结果写入output中
+                close(input[1]);
+                close(output[0]);
+                //子进程要拿到参数，必须知道参数有多长,所以这里设置一个环境变量，而子进程即使进行了程序替换还是会继承环境变量
+                putenv((char *)param_size.c_str());
+                //管道本质是文件，程序替换之后，文件描述符可能被删除或者被替换掉，所以bin程序没有办法拿到这两个管道
+                //所以这里做一个规定，bin程序从标准输入读数据，向标准输出写数据，因此这里要进行重定向
+                dup2(input[0],0);
+                dup2(output[1],1);
+                execl(bin.c_str(), bin.c_str(), NULL);
+                //不用判断是否调用失败，如果替换失败，代码就没有被替换掉，程序继续运行就会exit
+                exit(1);
+            }
+            else
+            {   
+                close(input[0]);
+                close(output[1]);
+                char c;
+                for(auto i=0;i<size;i++)
+                {
+                    c=param[i];
+                    write(input[1], &c, 1);
+                }
+                waitpid(pid, NULL, 0);
+                while(read(output[0], &c, 1)>0)//管道本质是文件，而文件描述符的生命周期随进程，所以程序走到这里，waitpid肯定成功，子进程退出了，所以文件描述符会被关闭，而写端被关闭，read肯定不会阻塞
+                {
+                    response_text.push_back(c);
+                }
+
+                rsp->MakeStatusLine();
+                rsp->SetResourceSize(response_text.size());
+                rsp->MakeResponseHeader();
+
+                con->SendStatusLine(rsp);
+                con->SendResponseHeader(rsp);
+                con->SendResponseText(rsp, true);
+            }
+            return 200;
         }
         static void ProcessResponse(Connect *con, Http_Request *rq, Http_Response *rsp)
         {
@@ -469,7 +539,7 @@ class Entry
             {
                 //能走到这里，说明请求中肯定传参了，而且这个参数已经拿到了
                 LOG("MakeResponse Use Cgi!", NORMAL);
-                //ProcessCgi(con, rq, rsp);
+                ProcessCgi(con, rq, rsp);
             }
             else
             {
@@ -477,19 +547,19 @@ class Entry
                 ProcessNonCgi(con, rq, rsp);
             }
         }
-        static void *HandlerRequest(void* arg)
+        static void HandlerRequest(int sock)
         {
             pthread_detach(pthread_self());
-            int *sock=(int*)arg;
+            //int *sock=(int*)arg;
 
 #ifdef _DEBUG_
             //for test
             char buff[10240];
-            read(*sock,buff,sizeof(buff));
+            read(sock,buff,sizeof(buff));
             std::cout<<buff<<std::endl;
 
 #else
-            Connect *con=new Connect(*sock);
+            Connect *con=new Connect(sock);
             Http_Request *rq=new Http_Request;
             Http_Response *rsp=new Http_Response;
             int& code=rsp->GetCode();
@@ -523,9 +593,9 @@ end:
             delete con;
             delete rq;
             delete rsp;
-            delete sock;
+            //delete sock;
 #endif
-            return NULL;
+            //return NULL;
         }
 };
 

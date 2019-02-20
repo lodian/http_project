@@ -3,7 +3,7 @@
 
 static void Usage(std::string proc)
 {
-    std::cout<<"Usage: "<<proc<<"port"<<std::endl;
+    std::cout<<"Usage: "<<proc<<" "<<"port"<<std::endl;
 }
 
 int main(int argc, char *argv[])
