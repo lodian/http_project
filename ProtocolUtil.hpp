@@ -85,9 +85,25 @@ class Util
             {
                 return "text/html";
             }
+            if(suffix==".css")
+            {
+                return "text/css";
+            }
+            if(suffix==".svg")
+            {
+                return "text/xml";
+            }
             if(suffix==".jpg")
             {
                 return "application/x-jpg";
+            }
+            if(suffix==".png")
+            {
+                return "application/x-png";
+            }
+            if(suffix==".ico")
+            {
+                return "image/x-icon";
             }
             return "text/html";
         }
@@ -270,7 +286,6 @@ class Http_Request{
             {
                 path+=HOMEPAGE;
             }
-
         }
         void HeaderParse()
         {
