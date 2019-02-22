@@ -29,6 +29,7 @@
 #define WEBROOT "wwwroot"
 #define HOMEPAGE "index.html"
 #define HTTPVERSION "HTTP/1.0"
+#define HTML_404 "wwwroot/404.html"
 
 const char *ErrLevel[]={
     "Normal",
@@ -64,8 +65,12 @@ class Util
             {
                 case 200:
                     return "OK";
+                case 400:
+                    return "Bad Request";
                 case 404:
                     return "Page Not Found";
+                case 500:
+                    return "Internal Server Error"; 
                 default:
                     break;
             }
@@ -106,6 +111,26 @@ class Util
                 return "image/x-icon";
             }
             return "text/html";
+        }
+        static std::string CodeToExceptFile(int code)
+        {
+            switch(code)
+            {
+                case 400:
+                    return HTML_404;
+                case 404:
+                    return HTML_404;
+                case 500:
+                    return HTML_404;
+                default:
+                    return "";
+            }
+        }
+        static int GetFileSize(std::string &except_path)
+        {
+            struct stat st;
+            stat(except_path.c_str(), &st);
+            return st.st_size;
         }
 };
 class SocketApi{
@@ -337,7 +362,7 @@ class Http_Request{
             rsp->SetPath(path);
             rsp->SetResourceSize(rs);
             LOG("Path is OK!", NORMAL);
-            return 0;
+            return 200;
         }
         bool IsNeedContinueRecv()
         {
@@ -467,6 +492,14 @@ class Connect
                 send(sock, rsp_text.c_str(), rsp_text.size(), 0);
             }
         }
+        void ClearRequest()
+        {
+            std::string line;
+            while(line!="\n")
+            {
+                RecvOneLine(line);//出函数作用域自动销毁，相当于把请求清掉了
+            }
+        }
         ~Connect()
         {
             close(sock);
@@ -476,7 +509,7 @@ class Connect
 class Entry
 {
     public:
-        static void ProcessNonCgi(Connect *con, Http_Request *rq, Http_Response *rsp)
+        static int ProcessNonCgi(Connect *con, Http_Request *rq, Http_Response *rsp)
         {
             rsp->MakeStatusLine();
             rsp->MakeResponseHeader();
@@ -486,6 +519,7 @@ class Entry
             con->SendResponseHeader(rsp);//将空行一起构建好发送
             con->SendResponseText(rsp, false);
             LOG("Send Response Done!", NORMAL);
+            return 200;
         }
         static int ProcessCgi(Connect *con, Http_Request *rq, Http_Response *rsp)
         {
@@ -504,8 +538,8 @@ class Entry
             pid_t pid=fork();
             if(pid<0)
             {
-                return 503;
                 LOG("Fork Error!", WARNING);
+                return 500;
             }
             else if(pid==0)
             {
@@ -548,7 +582,7 @@ class Entry
             }
             return 200;
         }
-        static void ProcessResponse(Connect *con, Http_Request *rq, Http_Response *rsp)
+        static int ProcessResponse(Connect *con, Http_Request *rq, Http_Response *rsp)
         {
             if(rq->IsCgi())
             {
@@ -582,14 +616,15 @@ class Entry
             rq->RequestLineParse();
             if(!rq->IsMethodLegal())
             {
-                code=404;
+                code=400;//请求方法不对，客户端错误,但是也应该继续读完请求，给客户端响应
+                con->ClearRequest();
                 LOG("Request Method Is Not Legal!",WARNING);
                 goto end;
             }
             rq->UriParse();
-            if(rq->IsPathLegal(rsp)!=0)
+            if((code = rq->IsPathLegal(rsp)) != 200)
             {
-                code=404; 
+                con->ClearRequest();
                 LOG("file is not exist!",WARNING);
                 goto end;
             }
@@ -601,10 +636,18 @@ class Entry
                 con->RecvText(rq->request_text, rq->ContentLength());
             }
             LOG("Http Request Recv Done!", NORMAL);
-            ProcessResponse(con, rq,rsp);
+            code = ProcessResponse(con, rq,rsp);
 
 
-end:
+end:        
+            if(code != 200)
+            {
+                std::string except_path = Util::CodeToExceptFile(code);
+                int rs = Util::GetFileSize(except_path);
+                rsp->SetPath(except_path);
+                rsp->SetResourceSize(rs);
+                ProcessNonCgi(con, rq, rsp);
+            }
             delete con;
             delete rq;
             delete rsp;
