@@ -27,7 +27,7 @@
 #define ERROR 2
 
 #define WEBROOT "wwwroot"
-#define HOMEPAGE "index.html"
+#define HOMEPAGE "login.html"
 #define HTTPVERSION "HTTP/1.0"
 #define HTML_404 "wwwroot/404.html"
 
@@ -110,8 +110,9 @@ class Util
             {
                 return "image/x-icon";
             }
-            return "text/html";
+            return "text/html;charset=utf-8";
         }
+        
         static std::string CodeToExceptFile(int code)
         {
             switch(code)
@@ -277,8 +278,9 @@ class Http_Request{
         std::string query_string;
         std::unordered_map<std::string,std::string> header_kv;
         bool cgi;
+        bool php_cgi;
     public:
-        Http_Request():path(WEBROOT),cgi(false),blank("\r\n")
+        Http_Request():path(WEBROOT),cgi(false),php_cgi(false),blank("\r\n")
     {}
         void RequestLineParse()//将一个字符串以空格分割成三个字符串
         {
@@ -288,9 +290,16 @@ class Http_Request{
         }
         void UriParse()
         {
-            if(method=="GET")
+            std::string suffix;
+            std::size_t pos=0;
+            pos=uri.rfind('.');
+            if(pos!=std::string::npos)
             {
-                std::size_t pos=uri.find('?');
+                suffix=uri.substr(uri.rfind('.'));
+            }
+            if(method=="GET" && suffix!=".php")
+            {
+                pos=uri.find('?');
                 if(pos!=std::string::npos)
                 {
                     cgi=true;
@@ -302,9 +311,28 @@ class Http_Request{
                     path+=uri;
                 }
             }
-            else
+            else if(method=="POST" && suffix!=".php")
             {
                 cgi=true;
+                path+=uri;
+            }
+            else if(method=="GET" && suffix==".php")
+            {
+                pos=uri.find('?');
+                if(pos!=std::string::npos)
+                {
+                    php_cgi=true;
+                    path+=uri.substr(0,pos);
+                    query_string=uri.substr(pos+1);
+                } 
+                else
+                {
+                    path+=uri;
+                }
+            }
+            else if(method=="POST" && suffix==".php")
+            {
+                php_cgi=true;
                 path+=uri;
             }
             if(path[path.size() - 1] == '/')
@@ -320,6 +348,10 @@ class Http_Request{
                 Util::MakeKV(*it, k, v);
                 header_kv.insert({k,v});
             }
+        }
+        std::string &GetMethod()
+        {
+            return method; 
         }
         bool IsMethodLegal()
         {
@@ -371,6 +403,10 @@ class Http_Request{
         bool IsCgi()
         {
             return cgi;
+        }
+        bool IsPhpCgi()
+        {
+            return php_cgi;
         }
         int ContentLength()
         {
@@ -472,9 +508,19 @@ class Connect
                 send(sock,it->c_str(),it->size(),0);
             }
         }
-        void SendResponseText(Http_Response *rsp, bool _cgi)
+        void SendResponseText(Http_Response *rsp, bool _cgi, bool php_cgi)
         {
-            if(!_cgi)
+            if(_cgi==true && php_cgi==false) 
+            {
+                std::string &rsp_text=rsp->response_text;
+                send(sock, rsp_text.c_str(), rsp_text.size(), 0);
+            }
+            else if(php_cgi==true && _cgi==false)
+            {
+                std::string &rsp_text=rsp->response_text;
+                send(sock, rsp_text.c_str(), rsp_text.size(), 0);
+            }
+            else
             {
                 std::string &path=rsp->GetPath();
                 int fd=open(path.c_str(), O_RDONLY);
@@ -485,11 +531,6 @@ class Connect
                 }
                 sendfile(sock,fd,NULL,rsp->ResourceSize());
                 close(fd);
-            }
-            else
-            {
-                std::string &rsp_text=rsp->response_text;
-                send(sock, rsp_text.c_str(), rsp_text.size(), 0);
             }
         }
         void ClearRequest()
@@ -517,7 +558,7 @@ class Entry
 
             con->SendStatusLine(rsp);
             con->SendResponseHeader(rsp);//将空行一起构建好发送
-            con->SendResponseText(rsp, false);
+            con->SendResponseText(rsp, false, false);
             LOG("Send Response Done!", NORMAL);
             return 200;
         }
@@ -578,10 +619,78 @@ class Entry
 
                 con->SendStatusLine(rsp);
                 con->SendResponseHeader(rsp);
-                con->SendResponseText(rsp, true);
+                con->SendResponseText(rsp, true, false);
             }
-            return 200;
         }
+        static int ProcessPhpCgi(Connect *con, Http_Request *rq, Http_Response *rsp)
+        {
+            int output[2];
+            pipe(output);
+            std::string php_bin=rsp->GetPath();
+            std::string request_method="REQUEST_METHOD=";
+            request_method+=rq->GetMethod();
+            std::string param=rq->GetParam();
+            
+            std::string username="username=";
+            std::string password="password=";
+            std::string pwd_again;
+
+            std::size_t equal_pos=param.find('=');
+            username+=param.substr(equal_pos+1);
+            username.erase(username.find('&'));
+
+            equal_pos=param.find('=',equal_pos+1);
+            password+=param.substr(equal_pos+1);
+            std::size_t and_pos=password.find('&');
+            if(and_pos!=std::string::npos)
+            {
+                password.erase(and_pos);
+                equal_pos=param.find('=',equal_pos+1);
+                pwd_again="pwd_again=";
+                pwd_again+=param.substr(equal_pos+1);
+            }
+            std::string &response_text=rsp->response_text;
+
+            pid_t pid=fork();
+            if(pid<0)
+            {
+                LOG("Fork Error!", WARNING);
+                return 500;
+            }
+            else if(pid==0)
+            {
+                close(output[0]);
+                putenv((char *)request_method.c_str());
+                putenv((char *)username.c_str());
+                putenv((char *)password.c_str());
+                if(pwd_again!="")
+                {
+                    putenv((char *)pwd_again.c_str());
+                }
+                dup2(output[1],1);
+                execl("/bin/php", "php", php_bin.c_str(), NULL);
+                exit(1);
+            }
+            else
+            {   
+                close(output[1]);
+                char c;
+                waitpid(pid, NULL, 0);
+                while(read(output[0], &c, 1)>0)
+                {
+                    response_text.push_back(c);
+                }
+
+                rsp->MakeStatusLine();
+                rsp->SetResourceSize(response_text.size());
+                rsp->MakeResponseHeader();
+
+                con->SendStatusLine(rsp);
+                con->SendResponseHeader(rsp);
+                con->SendResponseText(rsp, false, true);
+            }
+        }
+        
         static int ProcessResponse(Connect *con, Http_Request *rq, Http_Response *rsp)
         {
             if(rq->IsCgi())
@@ -589,6 +698,11 @@ class Entry
                 //能走到这里，说明请求中肯定传参了，而且这个参数已经拿到了
                 LOG("MakeResponse Use Cgi!", NORMAL);
                 ProcessCgi(con, rq, rsp);
+            }
+            else if(rq->IsPhpCgi())
+            {
+                LOG("MakeResponse Use PhpCgi!", NORMAL);
+                ProcessPhpCgi(con, rq, rsp);
             }
             else
             {
@@ -656,5 +770,4 @@ end:
             //return NULL;
         }
 };
-
 #endif
